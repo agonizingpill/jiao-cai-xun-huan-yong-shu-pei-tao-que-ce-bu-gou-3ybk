@@ -36,9 +36,11 @@ JWT8小时，PBKDF2盐化口令；Trace请求ID、Burst每IP每分钟360请求�
 
 ## Apriori与留出评估
 
-`backend/src/basket_rules.py`实现Apriori频繁项剪枝（最多三项），支持度≥0.15、置信度≥0.6、lift>1。96组固定seed38模拟课程篮，包含数学/物理/实验、语文/历史、数学/信息、美术/音乐等配套。先固定拆72训练/24留出，只用训练篮挖规则。留出每篮隐藏一科，剩余科为输入；命中隐藏科计召回，另记建议覆盖率与逐篮结果。这个口径是“每篮一个隐藏科的召回”，不是对真实学生需求的准确率承诺。
+`backend/src/basket_rules.py`实现Apriori频繁项剪枝（最多三项），支持度≥0.15、置信度≥0.6、lift>1。96组固定seed38模拟课程篮，包含数学/物理/实验、语文/历史、数学/信息、美术/音乐等配套：84个来源教学班各有一条主记录，其中8个班换编号重报一遍（HIST-085–092与HIST-001–008同班），4条旧篮（HIST-093–096）未认领。分析只取已认领篮，同一教学班只保留最后确认的一份，未认领旧篮先排除；按来源班哈希（seed38）分约3/4训练、1/4留出，同班不跨两侧，无关班的登记或合并不改变既有分组。留出每篮隐藏一科，剩余科为输入；命中隐藏科计召回，另记建议覆盖率与逐篮结果。这个口径是“每篮一个隐藏科的召回”，不是对真实学生需求的准确率承诺。
 
-worker从Redis取Pack ID，查询当前课程subject及历史篮，计算真实规则，DB recommendation与共享卷`/artifacts/basket-ID.json`持久化；保存训练/留出索引、source_checksum、阈值、规则support/confidence/lift、当前建议和留出病例。失败保存failed/error，队列恢复同Pack可重试。未实现worker硬崩溃后的running自动回收。
+库管可补登记课程篮来源班（`/baskets/claim`），主管确认两个编号同班（`/baskets/merge`，可显式指定来源班）。每次登记/合并推进basket_meta数据代次，用过这些编号的已发布留出成绩立即作废（Pack.scores_valid=false），其余成绩照常可查；作废成绩保留原文可复看，库管可重新分析。worker取数时记录代次，发布前在basket_meta行锁内复核：代次已变说明合并与分析并发，迟交的旧成绩直接丢弃不发布。每次分析携带唯一run令牌，队列重投或同次重试不会重复发布成绩。班级配套页显示分组与成绩是否仍有效、数据代次与训练/留出班数。
+
+worker从Redis取Pack ID与run令牌，查询当前课程subject及有效历史篮，计算真实规则，DB recommendation与共享卷`/artifacts/basket-ID.json`持久化；保存训练/留出篮ID、source_checksum、阈值、规则support/confidence/lift、当前建议和留出病例。失败保存failed/error，队列恢复同Pack可重试。未实现worker硬崩溃后的running自动回收。
 
 ## 一天的业务剧本
 
@@ -53,8 +55,8 @@ worker从Redis取Pack ID，查询当前课程subject及历史篮，计算真实�
 
 ## 结构与开发
 
-`backend/src/models.py`关系表、`schemas.py`输入校验、`common.py`库存锁/兼容查询/审计、`pack_service.py`配套与补购、`circulation_service.py`学生领退换/报损/清算、`basket_rules.py`真实Apriori、`worker.py`队列、`main.py`逐接口权限。前端六pages为catalog/inspection/packs/allocation/returns/deposits；`components/books.js`教材书脊、条码签、班级清单跨页复用；`utils/format.js`数据与转义、`utils/actions.js`请求错误恢复、store档案关联。前后端constants定义角色、Copy书况、配套/领用状态，后端规则校验、前端显示真实状态。
+`backend/src/models.py`关系表、`schemas.py`输入校验、`common.py`库存锁/兼容查询/审计、`pack_service.py`配套与补购、`circulation_service.py`学生领退换/报损/清算、`basket_service.py`来源班登记/同班合并/成绩作废、`basket_rules.py`真实Apriori、`worker.py`队列、`main.py`逐接口权限。前端六pages为catalog/inspection/packs/allocation/returns/deposits；`components/books.js`教材书脊、条码签、班级清单跨页复用；`utils/format.js`数据与转义、`utils/actions.js`请求错误恢复、store档案关联。前后端constants定义角色、Copy书况、配套/领用状态，后端规则校验、前端显示真实状态。
 
-本地后端安装requirements并设置DATABASE_URL/REDIS_URL/JWT_SECRET，`uvicorn src.main:app --reload`与`python -m src.worker`；前端保留Compose Nginx /api代理。seed自然键只补缺，不覆盖人工检查、条码状态、兼容核定、配套、已付押金/损耗/退款；历史训练篮固定96条。测试、日志与截图在`../../test-artifacts/gb-1038/`，不混入生产源码。
+本地后端安装requirements并设置DATABASE_URL/REDIS_URL/JWT_SECRET，`uvicorn src.main:app --reload`与`python -m src.worker`；前端保留Compose Nginx /api代理。seed自然键只补缺，不覆盖人工检查、条码状态、兼容核定、配套、已付押金/损耗/退款与课程篮来源班登记；历史训练篮固定96条。测试、日志与截图在`../../test-artifacts/gb-1038/`，不混入生产源码。
 
 局限：不接校园一卡通/支付/采购供应商；班级人数是课程份数上限，不建选课排课；押金按要求课程版次计，不按旧书折旧计；退书后不自动转配，库管需发起新配套；补购只记数量到货，不计采购款；未实现整配套取消释放、兼容映射撤销、学期账户重开或硬崩溃任务回收；课程篮为模拟数据。

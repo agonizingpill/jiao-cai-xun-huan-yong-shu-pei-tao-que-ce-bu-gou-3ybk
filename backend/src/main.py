@@ -1,4 +1,4 @@
-import os,logging
+import os,logging,uuid
 from contextlib import asynccontextmanager
 import redis
 from sqlalchemy import select
@@ -11,7 +11,7 @@ from .schemas import *
 from .common import lock,inventory_lock,pack,add,audit
 from .auth import current,writer,supervisor,verify,token
 from .middleware import Trace,Burst
-from . import pack_service as packs,circulation_service as circulation
+from . import pack_service as packs,circulation_service as circulation,basket_service as baskets
 q=redis.Redis.from_url(os.environ['REDIS_URL'],decode_responses=True)
 @asynccontextmanager
 async def lifespan(app):
@@ -35,7 +35,11 @@ def login(d:Login,s=Depends(session)):
 def me(u=Depends(current)):return {'email':u.email,'role':u.role}
 @app.get('/archive')
 def archive(s=Depends(session),u=Depends(current)):
-    return {m.__tablename__:[pack(x)for x in s.scalars(select(m).order_by(m.id))]for m in (Edition,Compatibility,Classroom,Student,Copy,Inspection,Pack,PackLine,Assignment,Purchase,Account,DepositEntry)}
+    data={m.__tablename__:[pack(x)for x in s.scalars(select(m).order_by(m.id))]for m in (Edition,Compatibility,Classroom,Student,Copy,Inspection,Pack,PackLine,Assignment,Purchase,Account,DepositEntry,HistoricalBasket)}
+    effective={b.id for b in baskets.effective_baskets(s)}
+    for b in data['historical_baskets']:b['effective']=b['id'] in effective
+    data['basket_generation']=s.scalar(select(BasketMeta.generation).where(BasketMeta.id==1))or 0
+    return data
 @app.get('/audits')
 def audits(s=Depends(session),u=Depends(current)):return [pack(x)for x in s.scalars(select(Audit).order_by(Audit.id.desc()).limit(50))]
 @app.post('/editions')
@@ -75,11 +79,17 @@ def pack_new(d:PackInput,s=Depends(session),u=Depends(writer)):
 @app.post('/packs/{id}/recommend')
 def recommend(id:int,s=Depends(session),u=Depends(writer)):
     p=lock(s,Pack,id)
-    if p.ml_state not in ('recorded','failed'):raise HTTPException(409,'只可估计新配套或失败重试')
-    p.ml_state='queued';p.error=None;s.commit()
-    try:q.rpush('book-baskets',id)
+    if p.ml_state not in ('recorded','failed') and not (p.ml_state=='ready' and not p.scores_valid):raise HTTPException(409,'只可估计新配套、失败重试或成绩作废后重新分析')
+    p.ml_run=str(uuid.uuid4());p.ml_state='queued';p.error=None;s.commit()
+    try:q.rpush('book-baskets',str(id)+':'+p.ml_run)
     except Exception:p.ml_state='failed';p.error='队列不可用，恢复后可重新排队';s.commit();raise HTTPException(503,p.error)
     return pack(p)
+@app.post('/baskets/claim')
+def basket_claim(d:BasketClaimInput,s=Depends(session),u=Depends(writer)):
+    x=baskets.claim(s,d,u);s.commit();return x
+@app.post('/baskets/merge')
+def basket_merge(d:BasketMergeInput,s=Depends(session),u=Depends(supervisor)):
+    x=baskets.merge(s,d,u);s.commit();return x
 @app.post('/packs/{id}/reserve')
 def reserve(id:int,s=Depends(session),u=Depends(supervisor)):
     x=packs.reserve(s,id,u);s.commit();return x
